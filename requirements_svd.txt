@@ -1,0 +1,7 @@
+# requirements_svd.txt (for SVD Recommender)
+pandas==2.2.2
+numpy==1.26.4
+scikit-surprise==1.1.4
+fastapi==0.110.0
+uvicorn==0.27.1
+python-multipart==0.0.9 
