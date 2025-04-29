@@ -1,172 +1,318 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict # Added Dict
 import pickle
 import os
-import argparse
 import pandas as pd
-from surprise import Dataset, Reader, SVD
+from surprise import Dataset, Reader, SVD # Ensure surprise is installed
 
-app = FastAPI(title="SVD Recommender API")
+# --- Firebase Admin Setup ---
+import firebase_admin
+from firebase_admin import credentials, firestore, auth
 
-# Global variable to store the trained model
-recommender = None
+# Initialize Firebase Admin SDK
+if not firebase_admin._apps:
+    # GCE should have Application Default Credentials available
+    firebase_admin.initialize_app()
+db = firestore.client()
+# --- End Firebase Admin Setup ---
 
+app = FastAPI(title="AURA Recommender API - Firestore & Auth") # Updated title
+
+# --- Authentication Setup ---
+auth_scheme = HTTPBearer()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(auth_scheme)) -> str:
+    """Dependency to verify Firebase token and return user ID (UID)."""
+    token = credentials.credentials
+    try:
+        decoded_token = auth.verify_id_token(token)
+        # TODO: Consider checking if token is revoked if needed: check_revoked=True
+        return decoded_token['uid']
+    except auth.ExpiredIdTokenError:
+         raise HTTPException(status_code=401, detail="Token expired", headers={"WWW-Authenticate": "Bearer"})
+    except auth.InvalidIdTokenError as e:
+         print(f"Token verification failed: {e}")
+         raise HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
+    except Exception as e: # Catch other potential auth errors
+        print(f"Authentication error: {e}")
+        raise HTTPException(status_code=401, detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
+# --- End Authentication Setup ---
+
+# --- Data Models ---
 class UserRequest(BaseModel):
-    user_id: str
-    n_recommendations: Optional[int] = 5
+    n_recommendations: Optional[int] = 10
 
-class Interaction(BaseModel):
-    user_id: str
-    outfit_id: str
-    interaction: int  # -1 for dislike, 1 for like, 3 for wishlist
+class InteractionInput(BaseModel):
+    outfit_id: str # Expecting the outfit document ID
+    interaction: int  # Use 1 for like, -1 for dislike, 3 for wishlist
 
 class InteractionRequest(BaseModel):
-    interactions: List[Interaction]
+    interactions: List[InteractionInput]
 
 class Recommendation(BaseModel):
     outfit_id: str
     score: float
     is_new: bool
 
-class RecommendationResponse(BaseModel):
-    recommendations: List[Recommendation]
+# We need outfit details to return to FlutterFlow
+class OutfitDetails(BaseModel):
+    outfit_id: str
+    brand: Optional[str] = None
+    description: Optional[str] = None
+    image_path: Optional[str] = None
+    style: Optional[str] = None
+    # Add other fields needed by FlutterFlow
 
+class RecommendationResponse(BaseModel):
+    # Return full outfit details along with recommendation info
+    recommendations: List[OutfitDetails] # CHANGED: Returning full details now
+# --- End Data Models ---
+
+# --- Global Variables ---
+recommender: Optional[SVD] = None
+all_outfit_ids: set = set()
+# --- End Global Variables ---
+
+# --- Helper Function ---
+async def fetch_outfit_details(outfit_ids: List[str]) -> Dict[str, OutfitDetails]:
+    """Fetches outfit details from Firestore for a list of outfit IDs."""
+    outfit_details = {}
+    if not outfit_ids:
+        return outfit_details
+
+    # Use parallel fetches if possible, or batch reads for larger lists
+    # Simple sequential fetch for now:
+    for outfit_id in outfit_ids:
+        try:
+            doc_ref = db.collection('outfits').document(outfit_id)
+            doc = await doc_ref.get() # Use async get if running uvicorn with workers > 1
+            # doc = doc_ref.get() # Use sync get if uvicorn workers = 1
+            if doc.exists:
+                data = doc.to_dict()
+                outfit_details[outfit_id] = OutfitDetails(
+                    outfit_id=doc.id,
+                    brand=data.get('brand'),
+                    description=data.get('description'),
+                    image_path=data.get('image_path'),
+                    style=data.get('Style') # Note case difference
+                    # map other fields...
+                )
+            else:
+                 print(f"Warning: Outfit document {outfit_id} not found.")
+        except Exception as e:
+            print(f"Error fetching details for outfit {outfit_id}: {e}")
+            # Decide how to handle missing details - skip or return partial?
+    return outfit_details
+# --- End Helper Function ---
+
+
+# --- API Events ---
 @app.on_event("startup")
 async def startup_event():
-    """Load the trained model when the API starts."""
-    global recommender
+    """Load the trained model and all outfit IDs at startup."""
+    global recommender, all_outfit_ids
+    print("API Startup: Loading resources...")
     try:
-        # Initialize the recommender
-        recommender = SVD()
-        
-        # Load the trained model
-        model_path = os.getenv('MODEL_PATH', 'trained_svd_model.pkl')
+        # Load Model
+        model_path = os.getenv('MODEL_PATH', 'trained_svd_model.pkl') # Use env var or default
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found at {model_path}")
-            
+            print(f"ERROR: Model file not found at {model_path}. API cannot serve recommendations.")
+            # Consider not setting recommender=None here to make health check fail clearly
+            return # Stop startup if model is essential
         with open(model_path, 'rb') as f:
             recommender = pickle.load(f)
-            
-        # Load the user interactions data
-        data_path = os.getenv('DATA_PATH', 'small_user_outfit_interactions.csv')
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"Data file not found at {data_path}")
-            
-        print("Model loaded successfully!")
-        
+        print(f"Model loaded successfully from {model_path}!")
+
+        # Load All Outfit IDs from 'outfits' collection
+        outfits_ref = db.collection('outfits')
+        # Use select([]) to only fetch IDs, more efficient if collection is large
+        docs = outfits_ref.select([]).stream()
+        all_outfit_ids = {doc.id for doc in docs}
+        if not all_outfit_ids:
+             print("Warning: No outfit IDs found in 'outfits' collection.")
+        else:
+             print(f"Loaded {len(all_outfit_ids)} unique outfit IDs.")
+
     except Exception as e:
-        print(f"Error loading model: {e}")
-        raise
+        print(f"FATAL ERROR during startup: {e}")
+        # Consider exiting or ensuring recommender stays None so endpoints fail clearly
+        recommender = None
+
 
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    return {"status": "healthy", "message": "SVD Recommender API is running"}
+    global recommender
+    status = "healthy" if recommender else "degraded (model not loaded/startup failed)"
+    return {"status": status, "message": "AURA Recommender API"}
+
 
 @app.post("/recommend", response_model=RecommendationResponse)
-async def get_recommendations(request: UserRequest):
-    """Get recommendations for a user."""
+async def get_recommendations(
+    request: UserRequest,
+    user_id: str = Depends(get_current_user) # Authenticated User ID
+):
+    """Get recommendations for the authenticated user."""
+    global recommender, all_outfit_ids
+
     if recommender is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
-    
+        raise HTTPException(status_code=503, detail="Recommendation model not available.")
+    if not all_outfit_ids:
+         raise HTTPException(status_code=404, detail="No outfits available for recommendations.")
+
+    print(f"Generating recommendations for user: {user_id}")
     try:
-        # Load current interactions
-        data_path = os.getenv('DATA_PATH', 'small_user_outfit_interactions.csv')
-        user_interactions = pd.read_csv(data_path)
-        
-        # Get all unique outfit IDs
-        all_outfits = set(user_interactions['outfit_id'])
-        
-        # Get outfits the user has already interacted with and their ratings
-        user_rated_outfits = user_interactions[
-            user_interactions['user_id'] == request.user_id
-        ][['outfit_id', 'interaction']].set_index('outfit_id')['interaction'].to_dict()
-        
-        # Get predictions for all outfits with stronger penalties for previously rated ones
+        # --- Fetch User's Interactions from Firestore (Likes, Dislikes, Wishlist) ---
+        user_ref = db.collection('users').document(user_id) # Reference to the user document
+        user_rated_outfits: Dict[str, int] = {} # Store {outfit_id: interaction_value}
+
+        # Fetch Likes
+        likes_ref = db.collection('Likes').where('user_ref_like', '==', user_ref)
+        like_docs = likes_ref.stream()
+        for doc in like_docs:
+            data = doc.to_dict()
+            outfit_ref = data.get('outfit_ref_like')
+            if outfit_ref and hasattr(outfit_ref, 'id'):
+                user_rated_outfits[outfit_ref.id] = 1 # Interaction value for like
+
+        # Fetch Dislikes
+        dislikes_ref = db.collection('Dislikes').where('user_ref_dislike', '==', user_ref)
+        dislike_docs = dislikes_ref.stream()
+        for doc in dislike_docs:
+            data = doc.to_dict()
+            outfit_ref = data.get('outfit_ref_dislike')
+            if outfit_ref and hasattr(outfit_ref, 'id'):
+                user_rated_outfits[outfit_ref.id] = -1 # Interaction value for dislike
+
+        # Fetch Wishlist (assuming collection name 'Wishlist' and fields 'user_ref_wishlist', 'outfit_ref_wishlist')
+        wishlist_ref = db.collection('Wishlist').where('user_ref_wishlist', '==', user_ref)
+        wish_docs = wishlist_ref.stream()
+        for doc in wish_docs:
+            data = doc.to_dict()
+            outfit_ref = data.get('outfit_ref_wishlist')
+            if outfit_ref and hasattr(outfit_ref, 'id'):
+                user_rated_outfits[outfit_ref.id] = 3 # Interaction value for wishlist
+
+        print(f"Fetched {len(user_rated_outfits)} total interactions for user {user_id}")
+        # --- End Firestore Interaction Fetch ---
+
+        # Generate predictions using SVD model
         predictions = []
-        for outfit_id in all_outfits:
-            pred = recommender.predict(request.user_id, outfit_id)
-            # Apply stronger penalty if outfit was previously rated
-            if outfit_id in user_rated_outfits:
-                # Stronger penalties based on the original rating:
-                # - For disliked outfits (-1), reduce score by 5.0
-                # - For liked outfits (1), reduce score by 4.0
-                # - For wishlisted outfits (3), reduce score by 4.5
-                penalty = {
-                    -1: 5.0,  # Stronger penalty for disliked items
-                    1: 4.0,   # Stronger penalty for liked items
-                    3: 4.5    # Stronger penalty for wishlisted items
-                }.get(user_rated_outfits[outfit_id], 3.0)
-                adjusted_score = pred.est - penalty
-            else:
-                adjusted_score = pred.est
-            
-            predictions.append((outfit_id, adjusted_score, outfit_id not in user_rated_outfits))
-        
-        # Sort by adjusted score and get top N
+        for outfit_id in all_outfit_ids:
+            if not outfit_id: continue # Should not happen with sets, but good practice
+
+            pred = recommender.predict(uid=user_id, iid=outfit_id)
+            adjusted_score = pred.est
+            is_new = outfit_id not in user_rated_outfits
+
+            # Apply penalties if the user has interacted before
+            if not is_new:
+                original_rating = user_rated_outfits.get(outfit_id)
+                penalty = 0.0
+                if original_rating == 1: penalty = 4.0   # Liked
+                elif original_rating == -1: penalty = 5.0  # Disliked
+                elif original_rating == 3: penalty = 4.5   # Wishlisted
+                adjusted_score -= penalty
+
+            predictions.append((outfit_id, adjusted_score, is_new))
+
+        # Sort by score, filter out already interacted if needed (or rely on penalties)
         predictions.sort(key=lambda x: x[1], reverse=True)
-        top_n = predictions[:request.n_recommendations]
-        
-        # Format the response
-        recommendations = [
-            Recommendation(
-                outfit_id=outfit_id,
-                score=score,
-                is_new=is_new
-            )
-            for outfit_id, score, is_new in top_n
+
+        # Get top N recommendations (IDs only first)
+        recommended_outfit_ids = [
+            outfit_id for outfit_id, score, is_new in predictions[:request.n_recommendations]
         ]
-        
-        return RecommendationResponse(recommendations=recommendations)
-        
+
+        # --- Fetch Full Details for Recommended Outfits ---
+        outfit_details_map = await fetch_outfit_details(recommended_outfit_ids)
+
+        # --- Format final response ---
+        # We need to return the details in the sorted order of recommendation
+        final_recommendations = []
+        for outfit_id in recommended_outfit_ids:
+            details = outfit_details_map.get(outfit_id)
+            if details:
+                final_recommendations.append(details)
+            # Else: decide if you want to fill with next best if details are missing
+
+        print(f"Returning {len(final_recommendations)} recommendations with details.")
+        return RecommendationResponse(recommendations=final_recommendations)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"ERROR generating recommendations for user {user_id}: {e}")
+        # Log the full traceback for debugging
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+
 
 @app.post("/update-interactions")
-async def update_interactions(request: InteractionRequest):
-    """Save new user interactions to new_interactions.csv."""
+async def update_interactions(
+    request: InteractionRequest,
+    user_id: str = Depends(get_current_user) # Authenticated User ID
+):
+    """Save new user interactions to the appropriate Firestore collection (Likes, Dislikes, Wishlist)."""
+    print(f"Updating interactions for user: {user_id}")
     try:
-        # Convert interactions to list of dictionaries
-        interactions = [
-            {
-                'user_id': interaction.user_id,
-                'outfit_id': interaction.outfit_id,
-                'interaction': interaction.interaction
-            }
-            for interaction in request.interactions
-        ]
-        
-        # Convert to DataFrame
-        new_df = pd.DataFrame(interactions)
-        
-        # Append to new_interactions.csv
-        if os.path.exists('new_interactions.csv'):
-            existing_df = pd.read_csv('new_interactions.csv')
-            new_df = pd.concat([existing_df, new_df], ignore_index=True)
-        
-        # Save to new_interactions.csv
-        new_df.to_csv('new_interactions.csv', index=False)
-        
-        return {"status": "success", "message": f"Added {len(interactions)} interactions to new_interactions.csv"}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        batch = db.batch()
+        count = 0
+        user_ref = db.collection('users').document(user_id) # User reference
 
+        for interaction in request.interactions:
+            outfit_ref = db.collection('outfits').document(interaction.outfit_id) # Outfit reference
+            interaction_data = { "timestamp": firestore.SERVER_TIMESTAMP } # Base data with timestamp
+            target_collection = None
+
+            if interaction.interaction == 1: # Like
+                target_collection = 'Likes'
+                interaction_data['user_ref_like'] = user_ref
+                interaction_data['outfit_ref_like'] = outfit_ref
+                interaction_data['created_at_like'] = firestore.SERVER_TIMESTAMP # Specific timestamp field
+            elif interaction.interaction == -1: # Dislike
+                target_collection = 'Dislikes'
+                interaction_data['user_ref_dislike'] = user_ref
+                interaction_data['outfit_ref_dislike'] = outfit_ref
+                interaction_data['created_at_dislike'] = firestore.SERVER_TIMESTAMP
+            elif interaction.interaction == 3: # Wishlist
+                target_collection = 'Wishlist'
+                interaction_data['user_ref_wishlist'] = user_ref
+                interaction_data['outfit_ref_wishlist'] = outfit_ref
+                interaction_data['created_at_wishlist'] = firestore.SERVER_TIMESTAMP
+            else:
+                print(f"Warning: Skipping unknown interaction type {interaction.interaction} for outfit {interaction.outfit_id}")
+                continue # Skip if interaction type isn't recognized
+
+            if target_collection:
+                # Create a new document reference in the target collection
+                doc_ref = db.collection(target_collection).document()
+                batch.set(doc_ref, interaction_data)
+                count += 1
+
+        # Commit the batch
+        if count > 0:
+            batch.commit()
+            print(f"Successfully added {count} interactions for user {user_id}")
+            return {"status": "success", "message": f"Added {count} interactions to Firestore"}
+        else:
+            print(f"No valid interactions provided for user {user_id}")
+            return {"status": "no_op", "message": "No valid interactions were processed"}
+
+
+    except Exception as e:
+        print(f"ERROR updating interactions for user {user_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error while saving interactions: {e}")
+
+
+# --- Main Execution (for testing locally) ---
 if __name__ == "__main__":
     import uvicorn
-    
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Run SVD Recommender API')
-    parser.add_argument('--model', type=str, default='trained_svd_model.pkl', help='Path to the trained model file')
-    parser.add_argument('--data', type=str, default='small_user_outfit_interactions.csv', help='Path to the user interactions data file')
-    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run the API on')
-    parser.add_argument('--port', type=int, default=8000, help='Port to run the API on')
-    args = parser.parse_args()
-    
-    # Set environment variables for the API
-    os.environ['MODEL_PATH'] = args.model
-    os.environ['DATA_PATH'] = args.data
-    
-    # Run the API
-    uvicorn.run(app, host=args.host, port=args.port) 
+    print("Starting Uvicorn server directly (for local testing)...")
+    # Use environment variables for model path if needed, otherwise defaults are used
+    # Example: Set MODEL_PATH env variable before running if needed
+    # export MODEL_PATH=/path/to/your/model.pkl
+    uvicorn.run("api:app", host='127.0.0.1', port=8000, reload=True) # Use reload for local dev
